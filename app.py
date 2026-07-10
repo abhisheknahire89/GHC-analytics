@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 from pathlib import Path
 import re
 from typing import Any
@@ -10,8 +11,12 @@ import duckdb
 import pandas as pd
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+from pdf_report import build_pdf
+from storage import get_analysis, get_analysis_by_hash, list_analyses, save_analysis
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -21,9 +26,12 @@ OUTPUT_DIR = BASE_DIR / "output"
 
 class AnalyzeRetentionRequest(BaseModel):
     file_path: str
+    file_hash: str | None = None
+    source_filename: str | None = None
 
 
 def _get_connection() -> duckdb.DuckDBPyConnection:
+    # Per-function in-memory connections keep the analytics isolated; reuse for very large files is future work.
     return duckdb.connect(database=":memory:")
 
 
@@ -100,10 +108,18 @@ def _load_rows(path: Path) -> tuple[list[dict[str, Any]], int, int]:
     return rows, raw_row_count, malformed_rows
 
 
+def _resolve_upload_path(file_path: str) -> Path:
+    requested = Path(file_path)
+    candidate = (UPLOAD_DIR / requested).resolve() if not requested.is_absolute() else requested.resolve()
+    try:
+        candidate.relative_to(UPLOAD_DIR.resolve())
+    except ValueError as exc:
+        raise ValueError("file_path must point to a file inside the uploads directory.") from exc
+    return candidate
+
+
 def load_and_clean(file_path: str) -> tuple[pd.DataFrame, dict[str, Any]]:
-    path = Path(file_path)
-    if not path.is_absolute():
-        path = BASE_DIR / path
+    path = _resolve_upload_path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
@@ -140,6 +156,8 @@ def load_and_clean(file_path: str) -> tuple[pd.DataFrame, dict[str, Any]]:
         "missing_order_id": int(df["order_id"].isna().sum() + df["order_id"].eq("").sum()),
         "missing_timestamps": int(df["created_at"].isna().sum()),
         "missing_total_quantity": int(df["total_quantity"].isna().sum()),
+        "defaulted_total_quantity": int(df["total_quantity"].isna().sum()),
+        "total_quantity_note": "Missing total_quantity values were defaulted to 0.",
         "missing_discount_type": int(original_discount_missing),
         "duplicate_order_ids": int(df["order_id"].duplicated().sum()),
         "malformed_rows": int(malformed_rows),
@@ -148,6 +166,7 @@ def load_and_clean(file_path: str) -> tuple[pd.DataFrame, dict[str, Any]]:
     clean = df.dropna(subset=["customer_id", "order_id", "created_at"]).copy()
     clean = clean[clean["customer_id"] != ""]
     clean = clean[clean["order_id"] != ""]
+    clean = clean.drop_duplicates(subset=["order_id"], keep="first")
     clean["total_quantity"] = clean["total_quantity"].fillna(0)
     clean = clean.sort_values(["customer_id", "created_at", "order_id"]).reset_index(drop=True)
 
@@ -482,6 +501,7 @@ def build_analytics_intelligence(
     followup_queries: list[str] = []
     segment_to_watch = {
         "segment_name": "insufficient_data",
+        "segment_group": "insufficient_data",
         "reason": "Upload more repeat-order history to identify the strongest intervention segment.",
         "suggested_experiment": "Test reminder timing after first order once repeat data is available.",
     }
@@ -502,19 +522,23 @@ def build_analytics_intelligence(
 
     if not time_to_second_segments.empty:
         fastest = time_to_second_segments.sort_values("median_days").iloc[0]
-        slowest = time_to_second_segments.sort_values("median_days", ascending=False).iloc[0]
+        slowest_by_group = time_to_second_segments.loc[
+            time_to_second_segments.groupby("segment_group")["median_days"].idxmax()
+        ].sort_values("median_days", ascending=False)
+        slowest = slowest_by_group.iloc[0]
         insights.append(
             {
                 "title": "Timing gap across segments",
                 "type": "pattern",
-                "metric_reference": f"{fastest['segment']} median {fastest['median_days']:.1f}d; {slowest['segment']} median {slowest['median_days']:.1f}d.",
+                "metric_reference": f"{fastest['segment']} median {fastest['median_days']:.1f}d; slowest by {slowest['segment_group']} is {slowest['segment']} at {slowest['median_days']:.1f}d.",
                 "impact_area": "diagnostics_followup",
                 "suggested_action": "Use segment-specific reminder timing instead of one fixed outreach schedule.",
             }
         )
         segment_to_watch = {
             "segment_name": str(slowest["segment"]),
-            "reason": f"This segment has the slowest median return at {slowest['median_days']:.1f} days, suggesting higher churn risk.",
+            "segment_group": str(slowest["segment_group"]),
+            "reason": f"Slowest by {slowest['segment_group']}: this segment has a median return of {slowest['median_days']:.1f} days, suggesting higher churn risk.",
             "suggested_experiment": "A/B test an earlier reminder plus a small incentive 7 days before its typical reorder window.",
         }
         followup_queries.append("Do slower second-order segments differ by clinic, geography, or acquisition channel?")
@@ -562,7 +586,7 @@ def build_plain_language_report(
     next_steps = [
         "Upload a larger file so we can see who comes back and when.",
     ]
-    target_line = "Target returning customers who bought mixed products with No discount for a reminder message after 30 days."
+    target_line = "Target returning customers whose first order used No discount for a reminder message after 30 days."
 
     if not repeat_purchase_rates.empty:
         rpr30 = repeat_purchase_rates.loc[repeat_purchase_rates["window_days"] == 30].iloc[0]
@@ -601,14 +625,18 @@ def build_plain_language_report(
             f"Repeat {best['discount_type']} with similar customers and review {worst['discount_type']} to see why people are not returning."
         )
 
-        segment_name = analytics_intelligence.get("segment_to_watch", {}).get("segment_name", "returning customers")
+        watch = analytics_intelligence.get("segment_to_watch", {})
+        segment_name = watch.get("segment_name", "returning customers")
+        segment_group = watch.get("segment_group", "")
         reminder_days = "35"
         if not time_to_second_segments.empty:
-            slowest = time_to_second_segments.sort_values("median_days", ascending=False).iloc[0]
+            slowest = time_to_second_segments.loc[
+                time_to_second_segments.groupby("segment_group")["median_days"].idxmax()
+            ].sort_values("median_days", ascending=False).iloc[0]
             reminder_days = str(max(int(float(slowest["median_days"])) - 7, 7))
         target_line = (
-            f"Target {segment_name} who bought mixed products with {best['discount_type']} "
-            f"for a refill reminder and light offer after {reminder_days} days."
+            f"Target {segment_name} customers (slowest by {segment_group}) whose first order used "
+            f"{best['discount_type']} for a refill reminder after {reminder_days} days."
         )
 
     return {
@@ -716,16 +744,59 @@ async def upload_csv(file: UploadFile = File(...)) -> dict[str, str]:
     file_path = UPLOAD_DIR / filename
     content = await file.read()
     file_path.write_bytes(content)
-    return {"file_path": str(file_path.relative_to(BASE_DIR))}
+    return {
+        "file_path": str(file_path.relative_to(UPLOAD_DIR)),
+        "file_hash": hashlib.sha256(content).hexdigest(),
+        "source_filename": Path(file.filename or "transactions.csv").name,
+    }
 
 
 @app.post("/analyze-retention")
 def analyze_retention(request: AnalyzeRetentionRequest) -> dict[str, Any]:
     try:
-        return _run_analysis(request.file_path)
+        path = _resolve_upload_path(request.file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+        file_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        cached = get_analysis_by_hash(file_hash)
+        if cached:
+            return {**cached["result"], "analysis_id": cached["id"], "cached": True}
+        result = _run_analysis(str(path))
+        record = save_analysis(
+            uuid4().hex,
+            request.source_filename or path.name,
+            file_hash,
+            result,
+        )
+        return {**result, "analysis_id": record["id"], "cached": False}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {exc}") from exc
+
+
+@app.get("/analyses")
+def get_past_analyses() -> list[dict[str, Any]]:
+    return list_analyses()
+
+
+@app.get("/analyses/{analysis_id}/export-pdf")
+def export_pdf(analysis_id: str) -> Response:
+    record = get_analysis(analysis_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Analysis not found.")
+    return Response(
+        content=build_pdf(record["result"], record["source_filename"]),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="retention_report_{analysis_id}.pdf"'},
+    )
+
+
+@app.get("/analyses/{analysis_id}")
+def get_analysis_full(analysis_id: str) -> dict[str, Any]:
+    record = get_analysis(analysis_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Analysis not found.")
+    return {**record["result"], "analysis_id": record["id"], "cached": True}

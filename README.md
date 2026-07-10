@@ -73,7 +73,13 @@ ui_explanations
 analytics_intelligence
 plain_language_report
 output_files
+analysis_id
+cached
 ```
+
+`GET /analyses` lists saved runs with filename, timestamp, and 30-day repeat rate.
+
+`GET /analyses/{id}` returns the complete stored result. `GET /analyses/{id}/export-pdf` streams a presentation-ready PDF of that result.
 
 Generated files are written locally to `output/`:
 
@@ -86,4 +92,4 @@ retention_by_discount.csv
 
 ## Privacy note
 
-Keep uploaded transaction data free of unnecessary personal or protected health information. The app runs locally and the baseline analytics do not call an external model or service.
+Keep uploaded transaction data free of unnecessary personal or protected health information. The app runs locally and the baseline analytics do not call an external model or service. `analyses.db` contains stored analysis results and must remain out of version control.

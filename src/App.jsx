@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Alert,
   Box,
@@ -271,11 +271,51 @@ function DiscountPerformance({ rows }) {
   );
 }
 
+function PastAnalyses({ items, activeId, onOpen }) {
+  return (
+    <Card>
+      <CardContent>
+        <Typography variant="h6" sx={{ mb: 1 }}>Past Analyses</Typography>
+        <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+          Reopen a saved analysis without uploading or processing the CSV again.
+        </Typography>
+        <Stack spacing={1}>
+          {items.length ? items.map((item) => (
+            <Box key={item.id} sx={{ alignItems: { xs: "flex-start", sm: "center" }, border: "1px solid", borderColor: item.id === activeId ? "primary.main" : "divider", borderRadius: 2, display: "flex", gap: 2, justifyContent: "space-between", p: 1.5 }}>
+              <Box>
+                <Typography variant="subtitle2">{item.source_filename}</Typography>
+                <Typography variant="body2" color="text.secondary">
+                  {new Date(item.created_at).toLocaleString()} · 30-day repeat: {formatPercent(item.rpr_30)}
+                </Typography>
+              </Box>
+              <Stack direction="row" spacing={1}>
+                <Button size="small" onClick={() => onOpen(item.id)}>Open</Button>
+                <Button size="small" component="a" href={`${API_BASE}/analyses/${item.id}/export-pdf`}>PDF</Button>
+              </Stack>
+            </Box>
+          )) : <Typography variant="body2" color="text.secondary">No saved analyses yet.</Typography>}
+        </Stack>
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function App() {
   const [file, setFile] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
+  const [history, setHistory] = useState([]);
+
+  const loadHistory = async () => {
+    const response = await fetch(`${API_BASE}/analyses`);
+    if (!response.ok) throw new Error("Could not load past analyses.");
+    setHistory(await response.json());
+  };
+
+  useEffect(() => {
+    loadHistory().catch(() => setHistory([]));
+  }, []);
 
   const handleAnalyze = async () => {
     if (!file) return;
@@ -296,12 +336,27 @@ export default function App() {
       const analyzeRes = await fetch(`${API_BASE}/analyze-retention`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ file_path: uploadData.file_path })
+        body: JSON.stringify(uploadData)
       });
       if (!analyzeRes.ok) throw new Error(await analyzeRes.text());
       setResult(await analyzeRes.json());
+      await loadHistory();
     } catch (err) {
       setError(err.message || "Request failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const openAnalysis = async (analysisId) => {
+    setLoading(true);
+    setError("");
+    try {
+      const response = await fetch(`${API_BASE}/analyses/${analysisId}`);
+      if (!response.ok) throw new Error(await response.text());
+      setResult(await response.json());
+    } catch (err) {
+      setError(err.message || "Could not open analysis");
     } finally {
       setLoading(false);
     }
@@ -349,6 +404,8 @@ export default function App() {
               </Stack>
             </CardContent>
           </Card>
+
+          <PastAnalyses items={history} activeId={result?.analysis_id} onOpen={openAnalysis} />
 
           {error ? <Alert severity="error">{error}</Alert> : null}
 
@@ -446,6 +503,11 @@ export default function App() {
                         {key}
                       </Link>
                     ))}
+                    {result.analysis_id ? (
+                      <Button component="a" href={`${API_BASE}/analyses/${result.analysis_id}/export-pdf`} variant="contained" size="small">
+                        Download PDF
+                      </Button>
+                    ) : null}
                   </Stack>
                 </CardContent>
               </Card>
@@ -485,6 +547,7 @@ export default function App() {
                           </Typography>
                           <Typography variant="body2" sx={{ mb: 1 }}>
                             <strong>{intelligence.segment_to_watch?.segment_name}</strong>
+                            {intelligence.segment_to_watch?.segment_group ? ` (${intelligence.segment_to_watch.segment_group})` : ""}
                           </Typography>
                           <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
                             {intelligence.segment_to_watch?.reason}
