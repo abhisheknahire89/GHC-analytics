@@ -58,7 +58,7 @@ It also maps common Shopify export fields, including `customer.id`, `order_numbe
 `POST /analyze-retention` accepts:
 
 ```json
-{ "file_path": "uploads/transactions.csv" }
+{ "file_path": "transactions.csv" }
 ```
 
 It returns JSON containing:

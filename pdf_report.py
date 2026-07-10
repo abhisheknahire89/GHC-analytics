@@ -65,12 +65,14 @@ def build_pdf(analysis_result: dict[str, Any], source_filename: str) -> bytes:
     body = ParagraphStyle("ReportBody", parent=styles["BodyText"], fontSize=9, leading=13, textColor=TEXT)
     small = ParagraphStyle("ReportSmall", parent=body, fontSize=8, leading=10)
     report = analysis_result["plain_language_report"]
+    divider = Table([[""],], colWidths=[182 * mm], rowHeights=[1])
+    divider.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), TEAL)]))
     story = [
         Paragraph("GHC Retention Analytics Report", title),
         Paragraph(f"Source: {_text(source_filename)}", small),
         Paragraph("Generated locally - no data leaves this environment", small),
         Spacer(1, 4),
-        Table([[""],], colWidths=[182 * mm], rowHeights=[1]).setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), TEAL)])),
+        divider,
         Paragraph("Executive summary", heading),
         Paragraph(_text(report.get("what_is_happening", "")), body),
     ]
