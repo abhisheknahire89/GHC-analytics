@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import csv
 from pathlib import Path
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -29,6 +31,75 @@ def _empty_frame(columns: list[str]) -> pd.DataFrame:
     return pd.DataFrame(columns=columns)
 
 
+def _first_present(row: dict[str, Any], candidates: list[str]) -> Any:
+    for key in candidates:
+        if key in row:
+            value = row.get(key)
+            if value is not None and str(value).strip() != "":
+                return value
+    return None
+
+
+def _parse_quantity(row: dict[str, Any]) -> float | None:
+    direct = _first_present(row, ["total_quantity", "quantity", "total_quantity_ordered"])
+    if direct is not None:
+        try:
+            return float(direct)
+        except (TypeError, ValueError):
+            return None
+
+    quantity_keys = [key for key in row if re.fullmatch(r"line_items\[\d+\]\.quantity", key)]
+    total = 0.0
+    found = False
+    for key in quantity_keys:
+        value = row.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            total += float(value)
+            found = True
+        except (TypeError, ValueError):
+            continue
+    return total if found else None
+
+
+def _parse_discount_type(row: dict[str, Any]) -> str:
+    direct = _first_present(row, ["discount_type", "discount_code", "discount_name"])
+    if direct is not None:
+        return str(direct).strip()
+
+    discount_keys = [key for key in row if re.fullmatch(r"discount_applications\[\d+\]\.title", key)]
+    values = []
+    for key in discount_keys:
+        value = row.get(key)
+        if value is None:
+            continue
+        cleaned = str(value).strip()
+        if cleaned:
+            values.append(cleaned)
+    unique_values = list(dict.fromkeys(values))
+    return " | ".join(unique_values)
+
+
+def _load_rows(path: Path) -> tuple[list[dict[str, Any]], int, int]:
+    rows: list[dict[str, Any]] = []
+    raw_row_count = 0
+    malformed_rows = 0
+
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise ValueError("CSV header is missing or unreadable.")
+
+        for row in reader:
+            raw_row_count += 1
+            if None in row:
+                malformed_rows += 1
+            rows.append(row)
+
+    return rows, raw_row_count, malformed_rows
+
+
 def load_and_clean(file_path: str) -> tuple[pd.DataFrame, dict[str, Any]]:
     path = Path(file_path)
     if not path.is_absolute():
@@ -36,16 +107,23 @@ def load_and_clean(file_path: str) -> tuple[pd.DataFrame, dict[str, Any]]:
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
-    con = _get_connection()
-    raw = con.execute("SELECT * FROM read_csv_auto(?, header=true)", [str(path)]).fetch_df()
-    raw.columns = [str(col).strip() for col in raw.columns]
+    raw_rows, raw_row_count, malformed_rows = _load_rows(path)
+    if not raw_rows:
+        raise ValueError("CSV contains no data rows.")
 
-    required = ["customer_id", "order_id", "created_at", "total_quantity", "discount_type"]
-    missing_columns = [col for col in required if col not in raw.columns]
-    if missing_columns:
-        raise ValueError(f"Missing required columns: {', '.join(missing_columns)}")
+    normalized_rows: list[dict[str, Any]] = []
+    for row in raw_rows:
+        normalized_rows.append(
+            {
+                "customer_id": _first_present(row, ["customer_id", "customer.id", "customer", "customerid"]),
+                "order_id": _first_present(row, ["order_id", "order_number", "order.name", "name"]),
+                "created_at": _first_present(row, ["created_at", "created_at_order", "order_date", "processed_at"]),
+                "total_quantity": _parse_quantity(row),
+                "discount_type": _parse_discount_type(row),
+            }
+        )
 
-    df = raw[required].copy()
+    df = pd.DataFrame(normalized_rows, columns=["customer_id", "order_id", "created_at", "total_quantity", "discount_type"])
     total_rows = len(df)
     original_discount_missing = df["discount_type"].isna().sum() + df["discount_type"].astype("string").str.strip().eq("").sum()
 
@@ -64,6 +142,7 @@ def load_and_clean(file_path: str) -> tuple[pd.DataFrame, dict[str, Any]]:
         "missing_total_quantity": int(df["total_quantity"].isna().sum()),
         "missing_discount_type": int(original_discount_missing),
         "duplicate_order_ids": int(df["order_id"].duplicated().sum()),
+        "malformed_rows": int(malformed_rows),
     }
 
     clean = df.dropna(subset=["customer_id", "order_id", "created_at"]).copy()
@@ -188,7 +267,7 @@ def compute_repeat_purchase_rates(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_time_to_second_segments(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
-        return _empty_frame(["segment", "customers", "median_days", "p25_days", "p75_days"])
+        return _empty_frame(["segment_group", "segment", "customers", "median_days", "p25_days", "p75_days"])
 
     con = _get_connection()
     con.register("transactions", df)
@@ -217,7 +296,7 @@ def compute_time_to_second_segments(df: pd.DataFrame) -> pd.DataFrame:
 
     repeaters = first_orders[first_orders["second_order_at"].notna()].copy()
     if repeaters.empty:
-        return _empty_frame(["segment", "customers", "median_days", "p25_days", "p75_days"])
+        return _empty_frame(["segment_group", "segment", "customers", "median_days", "p25_days", "p75_days"])
 
     median_basket = float(first_orders["first_total_quantity"].median())
     repeaters["days_to_second_order"] = (repeaters["second_order_at"] - repeaters["first_order_at"]).dt.days
@@ -227,21 +306,27 @@ def compute_time_to_second_segments(df: pd.DataFrame) -> pd.DataFrame:
     repeaters["basket_segment"] = repeaters["first_total_quantity"].ge(median_basket).map(
         {True: "large_basket", False: "small_basket"}
     )
-    repeaters["segment"] = repeaters["discount_segment"] + "__" + repeaters["basket_segment"]
 
-    stats = (
-        repeaters.groupby("segment")["days_to_second_order"]
-        .agg(
-            customers="count",
-            median_days="median",
-            p25_days=lambda s: s.quantile(0.25),
-            p75_days=lambda s: s.quantile(0.75),
+    frames = []
+    for segment_group, column in [("discount_usage", "discount_segment"), ("basket_size", "basket_segment")]:
+        stats = (
+            repeaters.groupby(column)["days_to_second_order"]
+            .agg(
+                customers="count",
+                median_days="median",
+                p25_days=lambda s: s.quantile(0.25),
+                p75_days=lambda s: s.quantile(0.75),
+            )
+            .reset_index()
+            .rename(columns={column: "segment"})
         )
-        .reset_index()
-    )
+        stats.insert(0, "segment_group", segment_group)
+        frames.append(stats)
+
+    result = pd.concat(frames, ignore_index=True)
     for col in ("median_days", "p25_days", "p75_days"):
-        stats[col] = stats[col].round(2)
-    return stats.sort_values("segment").reset_index(drop=True)
+        result[col] = result[col].round(2)
+    return result.sort_values(["segment_group", "segment"]).reset_index(drop=True)
 
 
 def compute_retention_by_discount(df: pd.DataFrame) -> pd.DataFrame:
@@ -300,6 +385,239 @@ def compute_retention_by_discount(df: pd.DataFrame) -> pd.DataFrame:
     ).fetch_df()
 
 
+def build_ui_explanations(
+    cohort_retention: pd.DataFrame,
+    repeat_purchase_rates: pd.DataFrame,
+    time_to_second_segments: pd.DataFrame,
+    retention_by_discount: pd.DataFrame,
+) -> dict[str, Any]:
+    cohort_summary = [
+        "No cohort retention data is available yet.",
+        "Upload more repeat-order history to compare cohort durability.",
+    ]
+    repeat_summary = [
+        "Repeat purchase windows are not available.",
+        "Additional repeat behavior is needed for early renewal analysis.",
+    ]
+    segment_summary = [
+        "No time-to-second-order segment data is available.",
+        "Second-order timing will appear once members place repeat orders.",
+    ]
+    discount_summary = [
+        "No discount retention data is available.",
+        "Discount-level refill behavior will appear after valid uploads.",
+    ]
+    primary_insight = "Upload data to generate the primary retention insight."
+    metric_tags = ["needs_data"]
+
+    if not cohort_retention.empty:
+        cohort_rates = cohort_retention[cohort_retention["interval_index"] > 0]
+        if not cohort_rates.empty:
+            best = cohort_rates.sort_values("retention_rate", ascending=False).iloc[0]
+            worst = cohort_rates.sort_values("retention_rate", ascending=True).iloc[0]
+            cohort_summary = [
+                f"Cohort {best['cohort_label']} shows the strongest follow-on retention at interval {int(best['interval_index'])} with rate {best['retention_rate']:.2f}.",
+                f"Cohort {worst['cohort_label']} has the weakest follow-on retention at interval {int(worst['interval_index'])} with rate {worst['retention_rate']:.2f}.",
+            ]
+
+    if not repeat_purchase_rates.empty:
+        rpr = repeat_purchase_rates.sort_values("window_days")
+        first = rpr.iloc[0]
+        last = rpr.iloc[-1]
+        lift = float(last["rate"] - first["rate"])
+        repeat_summary = [
+            f"Within {int(first['window_days'])} days, {int(first['repeat_customers'])} of {int(first['total_customers'])} members reordered for a rate of {first['rate']:.2f}.",
+            f"By {int(last['window_days'])} days, repeat rate reaches {last['rate']:.2f}, a {lift:.2f} lift versus the earliest window.",
+        ]
+
+    if not time_to_second_segments.empty:
+        fastest = time_to_second_segments.sort_values("median_days").iloc[0]
+        slowest = time_to_second_segments.sort_values("median_days", ascending=False).iloc[0]
+        segment_summary = [
+            f"Segment {fastest['segment']} returns fastest with median {fastest['median_days']:.1f} days to second order.",
+            f"Segment {slowest['segment']} returns slowest with median {slowest['median_days']:.1f} days, making it the clearest follow-up target.",
+        ]
+
+    if not retention_by_discount.empty:
+        best_discount = retention_by_discount.sort_values("rpr_90", ascending=False).iloc[0]
+        worst_discount = retention_by_discount.sort_values("rpr_30", ascending=True).iloc[0]
+        discount_summary = [
+            f"Discount type {best_discount['discount_type']} shows the strongest 90-day retention with repeat rate {best_discount['rpr_90']:.2f}.",
+            f"Discount type {worst_discount['discount_type']} has the weakest 30-day repeat rate at {worst_discount['rpr_30']:.2f}.",
+        ]
+        primary_insight = (
+            f"{best_discount['discount_type']} is the strongest near-term retention lever based on repeat behavior in this file."
+        )
+
+    tags: list[str] = []
+    if not repeat_purchase_rates.empty and float(repeat_purchase_rates.loc[repeat_purchase_rates["window_days"] == 30, "rate"].iloc[0]) < 0.35:
+        tags.append("early_churn")
+    if not retention_by_discount.empty and retention_by_discount["discount_type"].astype(str).str.contains("WELCOME", case=False).any():
+        tags.append("welcome_discount_signal")
+    if not time_to_second_segments.empty:
+        tags.append("second_order_timing")
+    if not cohort_retention.empty:
+        granularity = str(cohort_retention.iloc[0]["granularity"])
+        tags.append(f"{granularity}_cohorts")
+    if not retention_by_discount.empty and float(retention_by_discount["rpr_90"].max()) >= 0.6:
+        tags.append("high_potential_segment")
+    metric_tags = tags[:6] or metric_tags
+
+    return {
+        "cohort_summary": " ".join(cohort_summary),
+        "repeat_purchase_summary": " ".join(repeat_summary),
+        "segment_summary": " ".join(segment_summary),
+        "discount_summary": " ".join(discount_summary),
+        "primary_insight": primary_insight,
+        "metric_tags": metric_tags,
+    }
+
+
+def build_analytics_intelligence(
+    repeat_purchase_rates: pd.DataFrame,
+    time_to_second_segments: pd.DataFrame,
+    retention_by_discount: pd.DataFrame,
+) -> dict[str, Any]:
+    insights: list[dict[str, str]] = []
+    followup_queries: list[str] = []
+    segment_to_watch = {
+        "segment_name": "insufficient_data",
+        "reason": "Upload more repeat-order history to identify the strongest intervention segment.",
+        "suggested_experiment": "Test reminder timing after first order once repeat data is available.",
+    }
+
+    if not repeat_purchase_rates.empty:
+        rpr30 = repeat_purchase_rates.loc[repeat_purchase_rates["window_days"] == 30].iloc[0]
+        rpr90 = repeat_purchase_rates.loc[repeat_purchase_rates["window_days"] == 90].iloc[0]
+        insights.append(
+            {
+                "title": "Early renewal leakage",
+                "type": "risk",
+                "metric_reference": f"RPR 30d {rpr30['rate']:.2f} versus RPR 90d {rpr90['rate']:.2f}.",
+                "impact_area": "refill_retention",
+                "suggested_action": "Trigger refill reminders and care nudges before day 30 for first-order members.",
+            }
+        )
+        followup_queries.append("Which product or care pathway has the lowest 30-day repeat purchase rate?")
+
+    if not time_to_second_segments.empty:
+        fastest = time_to_second_segments.sort_values("median_days").iloc[0]
+        slowest = time_to_second_segments.sort_values("median_days", ascending=False).iloc[0]
+        insights.append(
+            {
+                "title": "Timing gap across segments",
+                "type": "pattern",
+                "metric_reference": f"{fastest['segment']} median {fastest['median_days']:.1f}d; {slowest['segment']} median {slowest['median_days']:.1f}d.",
+                "impact_area": "diagnostics_followup",
+                "suggested_action": "Use segment-specific reminder timing instead of one fixed outreach schedule.",
+            }
+        )
+        segment_to_watch = {
+            "segment_name": str(slowest["segment"]),
+            "reason": f"This segment has the slowest median return at {slowest['median_days']:.1f} days, suggesting higher churn risk.",
+            "suggested_experiment": "A/B test an earlier reminder plus a small incentive 7 days before its typical reorder window.",
+        }
+        followup_queries.append("Do slower second-order segments differ by clinic, geography, or acquisition channel?")
+
+    if not retention_by_discount.empty:
+        best = retention_by_discount.sort_values("rpr_90", ascending=False).iloc[0]
+        worst = retention_by_discount.sort_values("rpr_30").iloc[0]
+        insights.append(
+            {
+                "title": f"{best['discount_type']} drives loyalty",
+                "type": "opportunity",
+                "metric_reference": f"Top 90d repeat rate is {best['rpr_90']:.2f}.",
+                "impact_area": "plan_renewals",
+                "suggested_action": f"Expand {best['discount_type']} to similar members with matched first-order baskets.",
+            }
+        )
+        insights.append(
+            {
+                "title": f"{worst['discount_type']} needs review",
+                "type": "hypothesis",
+                "metric_reference": f"Lowest 30d repeat rate is {worst['rpr_30']:.2f}.",
+                "impact_area": "member_activation",
+                "suggested_action": "Review offer design, eligibility, and follow-up messaging for this discount path.",
+            }
+        )
+        followup_queries.append("How does discount performance change by basket size or first-order quantity band?")
+        followup_queries.append("Which discount types lead to higher 90-day order frequency without margin erosion?")
+
+    return {
+        "insights": insights[:6],
+        "followup_queries": followup_queries[:5],
+        "segment_to_watch": segment_to_watch,
+    }
+
+
+def build_plain_language_report(
+    repeat_purchase_rates: pd.DataFrame,
+    time_to_second_segments: pd.DataFrame,
+    retention_by_discount: pd.DataFrame,
+    analytics_intelligence: dict[str, Any],
+) -> dict[str, Any]:
+    happening_lines = [
+        "We do not have enough data yet to explain what is happening.",
+    ]
+    next_steps = [
+        "Upload a larger file so we can see who comes back and when.",
+    ]
+    target_line = "Target returning customers who bought mixed products with No discount for a reminder message after 30 days."
+
+    if not repeat_purchase_rates.empty:
+        rpr30 = repeat_purchase_rates.loc[repeat_purchase_rates["window_days"] == 30].iloc[0]
+        rpr60 = repeat_purchase_rates.loc[repeat_purchase_rates["window_days"] == 60].iloc[0]
+        rpr90 = repeat_purchase_rates.loc[repeat_purchase_rates["window_days"] == 90].iloc[0]
+        happening_lines = [
+            (
+                f"Most people are coming back slowly. {int(rpr30['repeat_customers'])} of "
+                f"{int(rpr30['total_customers'])} customers buy again within 30 days."
+            ),
+            f"By 60 days, {int(rpr60['repeat_customers'])} customers have bought again, and by 90 days that grows to {int(rpr90['repeat_customers'])}.",
+        ]
+
+        next_steps = [
+            "Send a refill or reorder reminder before day 30, because many people are not coming back quickly.",
+            "Use a second reminder between day 45 and day 60 for people who still have not returned.",
+        ]
+
+    if not time_to_second_segments.empty:
+        fastest = time_to_second_segments.sort_values("median_days").iloc[0]
+        slowest = time_to_second_segments.sort_values("median_days", ascending=False).iloc[0]
+        happening_lines.append(
+            f"People in {fastest['segment']} come back faster, while {slowest['segment']} takes the longest to return."
+        )
+        next_steps.append(
+            f"Give extra follow-up to {slowest['segment']}, because this group is the slowest to come back."
+        )
+
+    if not retention_by_discount.empty:
+        best = retention_by_discount.sort_values("rpr_90", ascending=False).iloc[0]
+        worst = retention_by_discount.sort_values("rpr_30").iloc[0]
+        happening_lines.append(
+            f"The offer {best['discount_type']} seems to keep people coming back best, while {worst['discount_type']} looks weakest early on."
+        )
+        next_steps.append(
+            f"Repeat {best['discount_type']} with similar customers and review {worst['discount_type']} to see why people are not returning."
+        )
+
+        segment_name = analytics_intelligence.get("segment_to_watch", {}).get("segment_name", "returning customers")
+        reminder_days = "35"
+        if not time_to_second_segments.empty:
+            slowest = time_to_second_segments.sort_values("median_days", ascending=False).iloc[0]
+            reminder_days = str(max(int(float(slowest["median_days"])) - 7, 7))
+        target_line = (
+            f"Target {segment_name} who bought mixed products with {best['discount_type']} "
+            f"for a refill reminder and light offer after {reminder_days} days."
+        )
+
+    return {
+        "what_is_happening": " ".join(happening_lines[:4]),
+        "what_should_we_do_next": next_steps[:5],
+        "target_line": target_line,
+    }
+
+
 def _json_ready(df: pd.DataFrame) -> list[dict[str, Any]]:
     if df.empty:
         return []
@@ -336,6 +654,23 @@ def _run_analysis(file_path: str) -> dict[str, Any]:
     repeat_purchase_rates = compute_repeat_purchase_rates(df)
     time_to_second_segments = compute_time_to_second_segments(df)
     retention_by_discount = compute_retention_by_discount(df)
+    ui_explanations = build_ui_explanations(
+        cohort_retention,
+        repeat_purchase_rates,
+        time_to_second_segments,
+        retention_by_discount,
+    )
+    analytics_intelligence = build_analytics_intelligence(
+        repeat_purchase_rates,
+        time_to_second_segments,
+        retention_by_discount,
+    )
+    plain_language_report = build_plain_language_report(
+        repeat_purchase_rates,
+        time_to_second_segments,
+        retention_by_discount,
+        analytics_intelligence,
+    )
     output_files = _write_outputs(
         cohort_retention,
         repeat_purchase_rates,
@@ -348,6 +683,9 @@ def _run_analysis(file_path: str) -> dict[str, Any]:
         "repeat_purchase_rates": _json_ready(repeat_purchase_rates),
         "time_to_second_segments": _json_ready(time_to_second_segments),
         "retention_by_discount": _json_ready(retention_by_discount),
+        "ui_explanations": ui_explanations,
+        "analytics_intelligence": analytics_intelligence,
+        "plain_language_report": plain_language_report,
         "output_files": output_files,
     }
 
